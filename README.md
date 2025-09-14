@@ -15,7 +15,7 @@ docker run --name postgres-db \
   -d postgres
 ```
 Then you also need the qdrant data base :
-First, pull the postgres qdrant image :
+First, pull the docker qdrant image :
 ```bash
 docker pull qdrant/qdrant
 ```
