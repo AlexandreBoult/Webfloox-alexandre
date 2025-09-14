@@ -1,0 +1,153 @@
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from dotenv import dotenv_values, load_dotenv
+from typing import List, Dict
+import numpy as np
+
+# ========================
+# Config
+# ========================
+load_dotenv()
+QDRANT_HOST = os.getenv("QDRANT_HOST")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT"))
+SOURCE_COLLECTION = os.getenv("QDRANT_COLLECTION") # The original collection with all points
+TARGET_COLLECTION = os.getenv("QDRANT_COLLECTION_2") # The new collection for unique points
+
+# ========================
+# Qdrant setup
+# ========================
+client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+client.recreate_collection(
+    collection_name=TARGET_COLLECTION,
+    vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
+)
+
+# ========================
+# Helper function to get all points from a collection
+# ========================
+def get_all_points(collection_name: str) -> List[Dict]:
+    """Retrieves all points from a Qdrant collection."""
+    all_points = []
+    offset = None
+    while True:
+        # Use the scroll API to get points in batches
+        scroll_result, next_offset = client.scroll(
+            collection_name=collection_name,
+            limit=100,  # Adjust batch size as needed
+            with_payload=True,
+            with_vectors=True,
+            offset=offset
+        )
+        points_to_process = [p.dict() for p in scroll_result]
+        all_points.extend(points_to_process)
+        if next_offset is None:
+            break
+        offset = next_offset
+    return all_points
+
+# ========================
+# Genericity calculation logic
+# ========================
+def calculate_and_filter_genericity(
+    max_z: float,
+    min_z: float,
+    source_collection: str,
+    target_collection: str,
+    top_k: int = 10,
+    batch_size: int = 50
+):
+    """
+    Calculates the genericity of each point and inserts low-genericity points
+    into a new collection.
+
+    :param source_collection: The name of the collection to read from.
+    :param target_collection: The name of the collection to write to.
+    :param similarity_threshold: A float between 0.0 and 1.0. Points with a
+                                 genericity score below this threshold are considered "unique".
+    :param top_k: The number of most similar points to consider for genericity score.
+    :param batch_size: The number of points to insert at once.
+    """
+    print("🔹 Retrieving all points from the source collection...")
+    all_points = get_all_points(source_collection)
+    print(f"✅ Found {len(all_points)} total points.")
+
+    unique_points_to_upsert = []
+    processed_count = 0
+    genericity_scores = []
+
+    # Ensure the target collection exists
+    client.recreate_collection(
+        collection_name=target_collection,
+        vectors_config=models.VectorParams(size=len(all_points[0]['vector']), distance=models.Distance.COSINE),
+    )
+    print(f"✅ Created new collection '{target_collection}' for unique points.")
+
+
+    for i, point in enumerate(all_points):
+        # Find the top_k most similar points (excluding the point itself)
+        search_results = client.search(
+            collection_name=source_collection,
+            query_vector=point['vector'],
+            limit=top_k + 1,  # +1 to account for the query point itself
+            with_payload=False,
+            with_vectors=False,
+        )
+
+        # Calculate the sum of similarity scores, skipping the query point itself
+        genericity_score = sum(result.score for result in search_results if result.id != point['id'])
+        genericity_scores.append(genericity_score)
+
+        # Check if the point is "unique" based on the threshold
+
+        processed_count += 1
+        if processed_count % 100 == 0:
+            print(f"Processing... {processed_count}/{len(all_points)} points analyzed.")
+
+    if genericity_scores:
+        average_genericity = np.mean(genericity_scores)
+        std_dev_genericity = np.std(genericity_scores)
+        print("\n--- Genericity Score Statistics ---")
+        print(f"Average Genericity: {average_genericity:.4f}")
+        print(f"Standard Deviation: {std_dev_genericity:.4f}")
+        print("-----------------------------------")
+
+    for i, point in enumerate(all_points):
+        genericity_score=genericity_scores[i]
+        if average_genericity - min_z*std_dev_genericity<=genericity_score <= average_genericity + max_z*std_dev_genericity :
+            # print(f"✨ Point ID {point['id']} is considered unique with score: {genericity_score:.4f}")
+            unique_points_to_upsert.append(
+                models.PointStruct(
+                    id=point['id'],
+                    vector=point['vector'],
+                    payload={**point['payload'], "genericity_score": genericity_score}
+                )
+            )
+
+    # Insert the filtered unique points into the new collection in batches
+    if unique_points_to_upsert:
+        print(f"\n🚀 Inserting {len(unique_points_to_upsert)} unique points into '{target_collection}'...")
+        for i in range(0, len(unique_points_to_upsert), batch_size):
+            batch = unique_points_to_upsert[i:i + batch_size]
+            client.upsert(collection_name=target_collection, points=batch)
+            print(f"Upserted batch of {len(batch)} points.")
+    else:
+        print("\n😔 No unique points found to insert.")
+
+    print("\n✅ Genericity analysis complete!")
+
+
+# ========================
+# Run
+# ========================
+if __name__ == "__main__":
+    # GENERECITY_THRESHOLD = 8.9604
+    calculate_and_filter_genericity(
+        max_z=5,
+        min_z=0.5,
+        source_collection=SOURCE_COLLECTION,
+        target_collection=TARGET_COLLECTION
+    )
